@@ -56,7 +56,8 @@
   grab impossible; replug triggers VID/PID re-discovery (node numbers are
   recycled). Scans flow daemon → per-terminal server queue
   (`app/routers/scanner.py`: terminal-secret writes, browser-token reads,
-  single-use 8-char pairing code, loopback-gated registration, kinds
+  single-use pairing offer file + one-click `/pair/auto`, loopback-gated
+  registration, kinds
   always re-derived server-side, 300 s TTL, **at-most-once** delivery via
   consume-on-poll) → the SPA's paced 1 s poll (`static/scanfeed.js`, a
   pure node-tested reducer; deliberately NO server-side hold — a hold
@@ -71,6 +72,51 @@
   (caught by the at-most-once test). The full live checklist is
   `docs/plans/r4-checklist.md`; the plan record is
   `docs/plans/COORDINATOR4.md` + `r4t1`…`r4t7`-FINAL.
+- **Post-round-4 UX**: removed the catalogue's visible scan field (the
+  "Scan items or badges here" box — the global capture is the scan path;
+  the typed-badge fallback field went too, later, in the login-screen
+  cleanup); semantic search now ranks **every** item by
+  similarity (no threshold — `vector-search`'s `limit` is omitted); purchase
+  history moved out of the profile's sub-tabs into its own top-level
+  **Purchase history** tab (`#/purchases`), beside Catalogue and My profile.
+- **Login-screen cleanup**: the badge-code toggle + collapsed fallback
+  field are gone (the global capture — "scan anywhere" — is the one
+  browser badge path; the typed-badge fallback is deliberately gone —
+  the browser path is capture-only, and `scripts/scanner_bridge.py` is
+  the non-browser fallback), and the terminal-pairing panel moved off
+  the login screen into the header pill (Unpair recovery included) on
+  every view.
+- **One-click pairing**: the unpaired pill is now a plain pair button —
+  `--register` writes a 0600 `{terminal_id, pairing_code}` offer file
+  (`<repo>/data/scanner-pairing.json`), and the click POSTs
+  `/api/scanner/pair/auto`: the server reads the file, pairs through the
+  SAME constant-time/single-use core as the manual endpoint, and
+  consumes the file on success only. Three gates, because a valid offer
+  on disk makes the endpoint a mint for the badge-bearing queue:
+  loopback-only by default (its own `HCRM_SCANNER_PAIR_ANY`, independent
+  of `HCRM_SCANNER_REGISTER_ANY`), a JSON content-type requirement (415 —
+  the CSRF gate), and the consumed single-use file. The code is not
+  printed by default (`--print-code` opts in for the manual `/pair`
+  fallback); the manual form is gone from the UI but the endpoint stays
+  for split-host deployments. The double-mint race in the shared core is
+  fixed by a conditional UPDATE (two racing clicks: exactly one 200).
+- **M-10 hardware finalization (2026-10-10 investigation, landed later)**:
+  the "plugged in but unreachable" episode was a **dead xHCI host
+  controller** (`0000:c3:00.3`, runtime-PM resume failure — the USB-A
+  jacks; root hubs stayed registered so it looked like a charge-only
+  cable), revived **without a reboot** via unbind/bind + PCI
+  remove/rescan. Landed: the dated diagnosis
+  (`docs/m10-unreachable-2026-10-10.md`), `scripts/usb_host_check.py`
+  (the dead-controller detector, honest recovery ladder + runtime-PM
+  prevention), `m10_scan_test.py`/`scanner_test.py` (can-it-read tests),
+  the ModemManager udev ignore (both forms), and the two-machine re-scope
+  of `docs/opticon-hardware.md`. Prevention is still outstanding on the
+  host (`power/control` is `auto` — expect a repeat on a future suspend;
+  `usb_host_check.py` now says so itself: a healthy controller on `auto`
+  gets an INFO nag with the prevention commands, and the permanent rule
+  it emits carries the systemd ≥ 255 `add|change` caveat),
+  and `065A:A001` stays `confirmed: False` until the USB COM Port sheet
+  is scanned.
 - **Staff** input/edit catalogue items, create member accounts, use a
   table/data-explorer view with CSV/PDF export and analysis.
 - **Admins** do everything, including account deletion and password resets.
@@ -165,8 +211,9 @@ Inventory-management/
 │   ├── scanner-opn2001.md   # Opticon OPN-2001 scanner: connection + protocol
 │   │                      #   (+ §3.4 WSL2 kernel/driver specifics)
 │   ├── opticon-hardware.md # CANONICAL: Opticon USB personalities, host
-│   │                      #   connection (incl. WSL2/usbipd), HID reception,
-│   │                      #   device-node permissions, provenance
+│   │                      #   connection (native-Linux + WSL2/usbipd), HID
+│   │                      #   reception, device-node permissions, provenance
+│   ├── m10-unreachable-2026-10-10.md # the dated dead-xHC diagnosis
 │   └── barcodes.md        # GTIN/GS1 number systems; same-item vs new-entry rules
 ├── tests/             # pytest suite (~160 tests, ~25 s, no network/model;
 │                      #   scanner tests run offline w/o hardware)
@@ -177,10 +224,18 @@ Inventory-management/
 │   ├── load_test.py   # concurrent login/read availability check (KNOWN FLAWS, §7)
 │   ├── opticon_detect.py # the repo's ONE map of Opticon USB personalities:
 │   │                  #   sysfs/COM/PnP discovery + WSL2 probes (stdlib-only)
+│   ├── usb_host_check.py # host-layer preflight BELOW detect: dead xHCI
+│   │                  #   controllers, MM/brltty grabbers, udev, modules
+│   │                  #   (docs/m10-unreachable-2026-10-10.md)
 │   ├── opn2001.py     # Opticon OPN-2001 connector: serial + raw-USB (pyusb)
 │   │                  #   backends, detect (docs/scanner-opn2001.md)
 │   ├── scanner_hid.py # live capture from USB-HID keyboard-mode scanners
 │   │                  #   (docs/opticon-hardware.md §3)
+│   ├── m10_scan_test.py  # can the attached scanner READ? EAN/QR targets
+│   │                  #   (QR via the vendored encoder), Z1/Z2 on COM
+│   ├── scanner_test.py   # OPN-2001 end-to-end + HID capture + M-10 pointer
+│   ├── agent_note.py  # collision-safe append (flock + O_APPEND) for a
+│   │                  #   shared agent coordination file; guarded --mirror
 │   ├── scan_intake.py # scans → catalogue verdicts (same/new/invalid, read-only)
 │   └── udev/99-opticon-scanner.rules  # device-node permissions (one-time sudo)
 ├── PLAN.md            # round-4 remediation plan (historical; findings A–H, P-1…P-4)
@@ -264,8 +319,10 @@ Inventory-management/
   matched literally (regression-tested).
 - `GET /api/items/vector-search` — embeds the query **once**, exact cosine scan
   via `vector_full_scan`, category filter applied **in SQL before LIMIT/OFFSET**
-  (pagination correctness), similarity clamped to [0,1]. Returns 503 if the
-  model isn't loaded or the extension failed.
+  (pagination correctness), similarity clamped to [0,1]. `limit` omitted →
+  **every** matching item ranked (no threshold); an explicit `limit` gives a
+  top-N slice (suggestions, “similar items”). Returns 503 if the model isn't
+  loaded or the extension failed.
 - Create/update policy when the embedding model is down: **503, nothing
   persisted** — an item that can't be embedded would be invisible to semantic
   search, and a PATCH must never null out an existing embedding (data-loss

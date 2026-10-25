@@ -13,9 +13,10 @@ one arithmetic the whole design stands on:
   references the HcrmScanCapture global at install time, so a reversed
   order is a silently dead scan bus (ui_check would only catch it as a
   console error, and only on a page that logs it).
-- the two [data-scan-sink] fields: the collapsed badge-code fallback and
-  the visible scan field must keep their dedicated Enter paths (the global
-  capture must never regress them).
+- the badge-code field is GONE (owner decision, login-screen cleanup): the
+  global capture ("scan anywhere") is the one browser badge path, so no
+  data-scan-sink may reappear — a sink takes its keys OUT of the capture
+  bus and forks the badge flow.
 - no isTrusted check: the M-10's USB host is dead
   (docs/m10-unreachable-2026-10-10.md), so console-dispatched synthetic
   KeyboardEvents are the only capture-verification path — a handler that
@@ -31,6 +32,30 @@ STATIC = REPO_ROOT / "static"
 
 def _read(name: str) -> str:
     return (STATIC / name).read_text(encoding="utf-8")
+
+
+def _method_body(header: str) -> str:
+    """Extract a method body from static/app.js by brace matching.
+
+    ``header`` must be the DEFINITION line's text ending in ``{`` (e.g.
+    ``"handleSessionExpired() {"``) so a call site can never match. The
+    honest alternative to unbounded ``\\{[\\s\\S]*?foo\\(`` regexes, which
+    lazily match a *later definition* and false-pass when the pinned call
+    is deleted (found by the round-2 review probe).
+    """
+    js = _read("app.js")
+    assert header.endswith("{"), "header must include the opening brace"
+    start = js.index(header)
+    open_i = start + len(header) - 1
+    depth = 0
+    for i in range(open_i, len(js)):
+        if js[i] == "{":
+            depth += 1
+        elif js[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:i + 1]
+    raise AssertionError(f"unbalanced braces after {header!r}")
 
 
 def test_scan_defer_exceeds_max_gap():
@@ -58,18 +83,46 @@ def test_scancapture_loads_before_app_js():
         "HcrmScanCapture global at install time")
 
 
-def test_both_scan_sinks_still_exist():
-    """The badge fallback field and the visible scan field own their keys.
+def _html_section(view: str) -> str:
+    """Extract one <section> block from index.html by its currentView guard
+    (from the guard to the next <section tag) — for pins that a view's own
+    markup must (not) carry. Anchored on the <section tag itself via regex:
+    the bare `currentView === '<view>'` string also appears in the nav's
+    :class bindings (catalogue/table/admin/account/purchases), which would
+    silently slice from the nav instead of the section.
 
-    The global capture returns early for [data-scan-sink] targets; losing
-    either attribute would route the M-10's keystrokes into BOTH the sink's
-    handler and the capture bus (double-fire) — or break the login fallback
-    entirely.
-    """
+    The end bound is whichever comes first of the next <section and </main>:
+    the LAST section (admin) has no following <section, so a next-tag-only
+    bound would make the helper unusable — and loudly misleading — for it."""
     html = _read("index.html")
-    assert html.count("data-scan-sink") >= 2, (
-        "expected both data-scan-sink fields (the collapsed badge-code "
-        "fallback on the login view and the visible scan field)")
+    m = re.search(rf"<section[^>]*currentView === '{view}'", html)
+    assert m, f"no <section> guard for view {view!r}"
+    bounds = [b for b in (html.find("<section", m.end()), html.find("</main>", m.end()))
+              if b != -1]
+    assert bounds, f"no following <section> or </main> after view {view!r}"
+    return html[m.start():min(bounds)]
+
+
+def test_badge_field_is_gone_scan_anywhere_is_the_path():
+    """The collapsed badge-code field and its toggle were removed (owner
+    decision, login-screen cleanup): the global capture is the ONE browser
+    badge path. The capture still honours [data-scan-sink] defensively
+    (app.js), but no such element may exist — a reintroduced sink would
+    take its keys out of the capture bus and fork the badge flow."""
+    html = _read("index.html")
+    # "data-scan-sink is" appears in prose; the attribute form must not.
+    assert not re.findall(r"data-scan-sink(?!\s+is)", html), (
+        "a data-scan-sink element came back — the global capture returns "
+        "early for sinks, so it would fork the badge flow")
+    assert "Use a badge code instead" not in html
+    assert "showBadgeField" not in html
+    assert "doBadgeLogin" not in html
+    app = _read("app.js")
+    assert "async badgeLogin(code)" in app, (
+        "the scan bus's badge login entry point must survive the field's "
+        "removal")
+    assert "logs you in automatically" in html, (
+        "the scan-anywhere copy is the only badge affordance left")
 
 
 def test_capture_never_checks_is_trusted():
@@ -159,15 +212,185 @@ def test_feed_sink_is_the_existing_scan_bus():
 
 def test_scanner_feed_pill_and_pairing_markup_present():
     """The pill (data-scanner-feed) renders on every view (the topbar), so
-    the operator can always see which scan path is live; the login screen
-    carries the pairing affordance (terminal id + 8-char code)."""
+    the operator can always see which scan path is live. It is a BUTTON,
+    and since the one-click change the MANUAL pairing form must be gone
+    EVERYWHERE — the unpaired pill pairs from the daemon's offer file in
+    one click, so any reintroduced terminal-id/code form would fork the
+    flow (the whole-file tightening of the old login-section-only pin:
+    the form's last home was the pill popover, not the login screen)."""
     html = _read("index.html")
+    app = _read("app.js")
     assert 'data-scanner-feed' in html, (
         "the data-scanner-feed pill binding is missing from index.html")
-    assert "pairTerminal" in html, (
-        "the login-screen pairing form is missing its submit handler")
+    assert re.search(r'<button[^>]*class="feed-pill"', html), (
+        "the pill must be a button — it pairs / manages the pairing")
     assert "unpairTerminal" in html, (
         "the unpair affordance is missing (recovery for a stale binding)")
+    # the manual pairing form must not come back ANYWHERE (whole file, not
+    # just the login section — replaces the login-section absence entries
+    # for these three strings)
+    for absent in ("Terminal id", "Pairing code", "pair-form",
+                   "Pair this terminal"):
+        assert absent not in html, (
+            f"{absent!r} must not be anywhere in index.html — the manual "
+            "pairing form is gone; the pill pairs in one click")
+    assert not re.search(r"pairForm|pairError", app), (
+        "the manual pairing form's state must not come back (pairForm/"
+        "pairError) — the one-click flow has no form state")
+    # (?<!un): unpairTerminal is the intended survivor
+    assert not re.search(r"(?<!un)pairTerminal", app), (
+        "the manual pairing submit must be gone — autoPair is the path")
+    # the LOGIN section keeps its own absence pin for the removed badge
+    # field (the login-screen cleanup, PR #35)
+    login = _html_section("login")
+    for absent in ("Scan your QR badge here", "Use a badge code instead"):
+        assert absent not in login, (
+            f"{absent!r} must not be on the login screen (removed, "
+            "login-screen cleanup)")
+
+
+def test_pill_is_one_click_pair_when_unpaired():
+    """The unpaired pill is a one-click PAIR BUTTON: @click routes through
+    onPillClick (a method, so these _method_body pins have a body to
+    read), which branches to autoPair() when unpaired. autoPair must call
+    the auto endpoint with raw: true (a 401 stale offer must never run
+    api()'s global session-expiry teardown) and carry the pairBusy
+    double-click guard — as a JS guard, NOT :disabled (disabling the
+    focused pill drops focus to <body> and greys a status indicator)."""
+    html = _read("index.html")
+    pill = re.search(r'<button[^>]*class="feed-pill"[^>]*>', html)
+    assert pill, "the feed pill button is missing"
+    assert '@click="onPillClick"' in pill.group(0), (
+        "the pill must route its click through onPillClick")
+    assert ":disabled" not in pill.group(0), (
+        "the pill must not carry :disabled — the busy guard is JS-side "
+        "(pairBusy), not a UA-disabled status pill")
+    app = _read("app.js")
+    click_body = _method_body("onPillClick() {")
+    assert 'this.scannerFeed === "unpaired"' in click_body \
+        and "autoPair()" in click_body, (
+            "onPillClick must branch to autoPair() when unpaired")
+    auto = _method_body("async autoPair() {")
+    assert '"/scanner/pair/auto"' in auto, (
+        "autoPair must call the one-click endpoint")
+    assert re.search(r'method: "POST", body: \{\}, raw: true,', auto), (
+        "autoPair must call the endpoint with raw: true (the exact call-"
+        "site form — a bare `raw: true` assert is satisfied by the comment "
+        "above the call, mutation-proven) — a 401 stale offer is not a "
+        "session expiry and must never log the kiosk out")
+    assert re.search(r"if \(this\.pairBusy\) return;", auto), (
+        "autoPair must carry the pairBusy double-click guard")
+
+
+def test_pair_popover_is_wired_to_the_pill():
+    """The PAIRED-state popover wiring: the pill's click toggle (via
+    onPillClick), the backdrop's outside-click dismissal, the
+    paired-only v-if mount (the unpaired pill is an action button, not a
+    disclosure), the pairOpen state + focus-management watcher, and the
+    _closeOverlays anti-stranding reset. A bare `pairOpen in html` is
+    satisfied by an HTML comment — every pin binds to real markup or
+    code."""
+    html = _read("index.html")
+    assert re.search(
+        r'<button[^>]*class="feed-pill"[^>]*@click="onPillClick"',
+        html), "the pill must route its click through onPillClick"
+    assert '<div class="popover-backdrop" @click="pairOpen = false">' \
+        in html, "the popover's outside-click backdrop is missing"
+    assert '<template v-if="pairOpen && scannerFeed !== \'unpaired\'">' \
+        in html, ("the popover must mount ONLY in the paired state — the "
+                  "unpaired pill pairs in one click and opens nothing")
+    app = _read("app.js")
+    assert re.search(r"^\s+pairOpen: false,", app, re.M), (
+        "the pairOpen data flag is missing")
+    # The watcher must exist AND do the focus management: a body-less
+    # `pairOpen(on) { return; }` satisfies an existence assert while the
+    # popover opens with focus nowhere and closes by dropping a keyboard
+    # user on <body> (the detached popover was the focused element).
+    watcher = _method_body("pairOpen(on) {")
+    assert ".pair-popover button" in watcher, (
+        "the pairOpen watcher must focus the popover's Unpair button — its "
+        "only focusable; the autofocus attribute only fires on initial "
+        "page load, not on a v-if mount")
+    assert ".feed-pill" in watcher, (
+        "the pairOpen watcher must return focus to the pill when the "
+        "popover closes")
+    assert "this.pairOpen = false;" in _method_body("_closeOverlays() {"), (
+        "_closeOverlays must close the popover with the other overlays")
+
+
+def test_pair_popover_cannot_strand_under_a_modal():
+    """The popover paints inside .topbar's stacking context (position:
+    sticky + z-index: 10), so it AND its full-viewport dismiss backdrop sit
+    below every .modal-backdrop (z-index: 50, all of them children of #app).
+    An open modal therefore makes the popover's inputs unclickable and its
+    outside-click backdrop unreachable — the popover can only be closed
+    after the modal is. The two guards: a barcode scanned while the popover
+    is open is dropped by the scan discipline ("finish the current dialog
+    first"), and every path that raises an overlay closes the popover
+    first. Losing any of them re-creates the stranded dropdown (PR #35
+    review round 1: qwen #2 / kimi #3 / glm F1)."""
+    app = _read("app.js")
+    assert "this.pairOpen" in _method_body("_modalOpen() {"), (
+        "_modalOpen() must count the pairing popover as an open dialog — "
+        "otherwise a barcode scanned while it is open raises the intake "
+        "modal over it and strands it")
+    for header in ("openNextIntake() {", "async afterLogin(data) {",
+                   "async armLogoff() {"):
+        assert "this.pairOpen = false;" in _method_body(header), (
+            f"{header} must close the pairing popover before raising its "
+            "own overlay or navigating — the popover cannot survive under "
+            "a modal (it paints below every .modal-backdrop)")
+    # Since the one-click change the popover mounts ONLY in the paired
+    # state: a server-side unpair (the poll's 401 — the terminal was
+    # deleted) flips the pill to unpaired with the popover open, and an
+    # INVISIBLE pairOpen=true still counts in _modalOpen() — every scan
+    # would drop to "finish the current dialog" with nothing on screen.
+    # The setPill effect is the one funnel every unpair passes through.
+    feed = _method_body("_applyFeedEffect(effect) {")
+    assert re.search(
+        r'effect\.mode === "unpaired"[\s\S]*?this\.pairOpen = false;',
+        feed), ("the setPill effect must close pairOpen when the pill goes "
+                "unpaired — otherwise the invisibly-open popover strands "
+                "the scan discipline")
+
+
+def test_unpair_is_operator_gated_and_the_pill_discloses():
+    """Unpair deletes the terminal token client-side and re-pairing needs a
+    FRESH single-use offer written by `scanner_daemon.py --register` on the
+    kiosk host — an operator-only recovery. The pill is on every view (the
+    login-screen panel was logged-out-only), so a logged-in member must not
+    get the button; `!user` preserves the logged-out first-install path.
+    The disclosure semantics are pinned with it — STATE-CONDITIONAL since
+    the one-click change: an unpaired pill is an action button and must
+    not announce a popup it does not have (the attrs bind to null)."""
+    html = _read("index.html")
+    assert re.search(
+        r'<button[^>]*v-if="!user \|\| isStaff"[^>]*@click="unpairTerminal"',
+        html), ("Unpair must be gated to logged-out or staff — otherwise any "
+                "logged-in member can disable the kiosk's scanner feed with "
+                "two clicks, recoverable only with shell access to the host")
+    assert re.search(r":aria-expanded=\"scannerFeed === 'unpaired' \? null", html), (
+        "aria-expanded must be state-conditional — absent (null) when the "
+        "pill is a one-click action button, present when it discloses")
+    assert re.search(r":aria-haspopup=\"scannerFeed === 'unpaired' \? null", html), (
+        "aria-haspopup must be state-conditional for the same reason")
+    assert 'role="dialog" aria-label="Scanner pairing"' in html, (
+        "the popover must be a labelled dialog")
+
+
+def test_unpair_closes_the_popover_and_states_the_recovery():
+    """Replaces the old focus-into-the-re-pair-form pin (the form is gone —
+    the pill itself is the re-pair affordance now). Unpair must close the
+    popover (the pill flips to the one-click state; an open paired-state
+    popover over it would strand) and toast the recovery loop, so the
+    operator knows the next action is --register, not a form."""
+    body = _method_body("unpairTerminal() {")
+    assert "this.pairOpen = false;" in body, (
+        "unpairTerminal must close the popover — the pill becomes the "
+        "one-click re-pair button and an open paired popover over it strands")
+    assert "--register" in body, (
+        "the unpair toast must name the recovery (re-run --register, then "
+        "click the pill)")
 
 
 def test_terminal_token_key_is_the_persisted_binding():
@@ -179,3 +402,62 @@ def test_terminal_token_key_is_the_persisted_binding():
                  'localStorage.setItem(TERMINAL_TOKEN_KEY',
                  'localStorage.removeItem(TERMINAL_TOKEN_KEY)'):
         assert call in app, f"missing {call} — the binding would not persist"
+
+
+def test_purchases_route_wiring_is_pinned():
+    """The #/purchases tab needs five cooperating pieces (nav link, view
+    mapping, section, watcher load, mounted load); drop any one and the
+    page renders EMPTY rather than erroring — exactly the silent shape
+    this suite exists to pin. The watcher/mounted pair is the piece a
+    well-meaning "de-duplication" eats, killing either deep links or
+    navigation."""
+    html = _read("index.html")
+    assert 'href="#/purchases"' in html
+    assert "currentView === 'purchases'" in html
+    watcher = _method_body("currentView(view) {")
+    assert "loadMyOrders()" in watcher, \
+        "the currentView watcher must load purchase history (navigation)"
+    mounted = _method_body("mounted() {")
+    assert "loadMyOrders()" in mounted, \
+        "mounted() must load purchase history (direct deep link)"
+
+
+def test_similar_items_fetch_pins_explicit_limit():
+    """openDetail's "similar items" fetch must keep its explicit limit=5:
+    the vector-search default is now rank-everything, so dropping the
+    parameter would silently fetch the whole catalogue per item click."""
+    js = _read("app.js")
+    assert re.search(
+        r'"/items/vector-search\?q="[\s\S]{0,300}?&limit=5', js), \
+        "the similar-items fetch must carry an explicit limit"
+
+
+def test_session_expired_clears_the_cart_view():
+    """BOTH 401 teardown paths must reset this.cart exactly like logout()
+    does: the next user can log in flagged (must_change_password skips
+    loadCart), so a lingering cart would display — and be mutable — under
+    the new token (a cross-user leak). The reset lives in the ONE
+    canonical handleSessionExpired(), and the event handler delegates to
+    it (api()'s throwing path) — the two paths cannot drift apart."""
+    js = _read("app.js")
+    body = _method_body("handleSessionExpired() {")
+    assert "this.cart = { lines: [], total_qty: 0, total_cents: 0 }" in body
+    assert "_cartImportedLegacy = false" in body
+    m = re.search(r'"hcrm-session-expired", \(\) => \{([\s\S]*?)\}\);', js)
+    assert m, "the hcrm-session-expired handler must exist"
+    assert "handleSessionExpired()" in m.group(1), \
+        "the event handler must delegate to the canonical teardown"
+
+
+def test_stale_search_responses_are_generation_guarded():
+    """reloadItems must bump a request generation and loadMore must drop
+    superseded responses on BOTH the resolve and the reject path: without
+    the reject-path refetch, an erroring superseded request abandons the
+    fresh reload and the grid silently stays empty (round-2 review). The
+    interleavings themselves are behaviour-tested in tests/js/
+    loadmore.test.mjs; this pins the mechanism's presence."""
+    js = _read("app.js")
+    assert "_itemsGen = (this._itemsGen || 0) + 1" in js
+    body = _method_body("async loadMore() {")
+    assert body.count("gen !== this._itemsGen) continue") == 2, \
+        "both the resolve and the reject path must refetch when superseded"

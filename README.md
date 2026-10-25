@@ -95,6 +95,9 @@ On first run the app seeds:
 | `HCRM_BADGE_SECRET` | unset | the QR-badge derivation master secret (32+ chars). Unset ⇒ a 32-byte key is auto-generated to `data/badge.key` (0600, announced at boot). **Back the key file up with the database** (`scripts/backup_db.sh` copies it) — losing it disables badge re-viewing (logins unaffected). A set-but-too-short value refuses to boot |
 | `HCRM_DOCS` | `1` | `0` disables `/docs`, `/redoc` **and** `/openapi.json` for production |
 | `FASTEMBED_CACHE_PATH` | `$TMPDIR/fastembed_cache` | where the embedding model is cached — note this is `/tmp` by default, so a tmp-cleaner wipes it and the next boot re-downloads ~80 MB |
+| `HCRM_SCANNER_REGISTER_ANY` | unset | `1` opens terminal registration (`POST /api/scanner/terminals`) to LAN clients — loopback-only by default |
+| `HCRM_SCANNER_PAIR_ANY` | unset | `1` opens one-click pairing (`POST /api/scanner/pair/auto`) to non-loopback callers — loopback-only by default, and **independent** of `HCRM_SCANNER_REGISTER_ANY` (the two flags answer different questions) |
+| `HCRM_SCANNER_PAIRING_FILE` | `<repo>/data/scanner-pairing.json` | the one-click pairing offer file the daemon writes on `--register` and the server reads + consumes on the first successful pair (0600; the daemon and the server must resolve the SAME path — set this on both sides if you override it) |
 | `HCRM_BROWSER` | auto | browser binary for `scripts/ui_check.py` (it probes each candidate and refuses to run with one that cannot log console messages) |
 
 ## Vector search with sqlite-vector
@@ -113,6 +116,61 @@ that adds SIMD-accelerated vector search:
   **650 ms per query at 1M items**. Comfortable up to ~100k items; beyond
   that, switch to the extension's quantized ANN scans (`vector_quantize` +
   `vector_quantize_scan`), which can be wired in without schema changes
+
+## Biogan supplier catalogue: crawl → import → serve
+
+The shop's own catalogue is refreshed from the supplier master CSV in three steps. Everything lives in
+`data/` — **git-ignored and never committed** (the CSV, `data/Catalogue-images/` and `data/hcrm.db`), so
+`git status` cannot show what a run changed. The crawler leaves a pre-first-run copy of the CSV
+(`data/Biogan - masterdata - Sheet.csv.bak`, written only when absent) to diff the CSV against; the database
+has no such copy, so take one first (`scripts/backup_db.sh`) if you need to compare before/after.
+
+```bash
+# 1. crawl: resolve one photo per SKU, download it, fill the CSV's "URL to photo" column
+uv run python scripts/biogan_photos.py --report /tmp/crawl.json    # ~1 req/s, resumable, --dry-run safe
+# 2. import: idempotent upsert of the 240 supplier rows into the catalogue
+uv run python scripts/import_biogan.py --report /tmp/import.json   # a second run is a no-op
+# 3. serve: the app already mounts GET /catalogue-images/<EAN>.<ext>
+uv run uvicorn app.main:app --port 8000
+```
+
+**Crawler** (`scripts/biogan_photos.py`, stdlib only): name search → exact `ProductID` → SKU-search rescue →
+flagged first result; it downloads the full-size `-p` image (`-t` fallback), magic-byte-checked, named
+`<EAN-13>.<ext>` in `data/Catalogue-images/`, and rewrites the CSV atomically after every row that fills a
+cell (EOL/EOF shape and file mode preserved, a BOM is tolerated but never written; a failed byte self-check
+aborts instead of writing). Options: `--limit`, `--only-sku`, `--size {p,t}`, `--no-download`, `--dry-run`
+(requests but no writes), `--force`, `--lock/--no-lock`, `--abort-after`, `--max-requests`. Exit codes: **0**
+every selected row ok/cached/downloaded/skipped · **1** at least one failing row **or** a row written on a
+flagged `first_result` match (the report lists both) · **2** lock held, breaker tripped, request budget
+exhausted or Ctrl-C · **3** usage or an unusable CSV.
+
+**Importer** (`scripts/import_biogan.py`): one transaction, upsert keyed on the exact `sku` string (`1709c` ≠
+`1709C`), CSV-verbatim names, `Sp3-Vejl.Pris` → `price_cents`, `EAN-nummer` → canonical GTIN-14 `barcode`
+(GS1-checked), `category="Biogan"`, `description=""`, and `stock` never reset on update (`--stock N` applies
+to creates only). A GTIN owned by another SKU refuses that row (a barcode is never stolen), and a blank or
+invalid supplier EAN never clears a stored barcode. `image_url` prefers the local
+`/catalogue-images/<EAN>.<ext>`, falls back to the CSV's remote photo URL (a `-p` URL for every row the
+current crawl filled), else `""`. Options: `--no-update`,
+`--dry-run` (no DDL, no commit), `--prune-demo` (removes only the 12 seeded `EX-*` demo items and their cart
+lines), `--crawl-report` (advisory provenance), `--category`, `--stock`, `--db`. Exit codes: **0** clean,
+including rows with no photo and deferred embeddings · **1** rows refused (GTIN conflict / bad price) while
+the rest commit · **2** unexpected error, whole run rolled back · **3** usage/precondition.
+
+**Photos**: `GET /catalogue-images/{name}` serves `data/Catalogue-images/` through an allowlist
+(`<13-digit EAN>.<jpg|jpeg|png|webp>` plus a magic-byte check), answers one uniform 404 for everything else
+(traversal, NUL, `.bak`/`.lock`/`.part-*`, zero-byte or non-image content, missing dir), and sets
+`Cache-Control: public, max-age=3600`. It is **unauthenticated by necessity** (an `<img>` cannot send a
+bearer), read-only, and never creates the directory. Root order: `$HCRM_CATALOGUE_IMAGES_DIR` →
+`$HCRM_DATA_DIR/Catalogue-images` → `<repo>/data/Catalogue-images`.
+
+**Known gaps**: 14 supplier SKUs have **no photo on the site**, so their `URL to photo` cell and DB
+`image_url` stay empty — `1327, 1709c, 1717B, 1773, 1842, 1989, 2223A, 2401, 2962, 2974, 4219, 4270, 4472,
+6700` (the crawler reports them as `no_result`; nothing is invented). Prices are stored as the supplier's DKK
+amounts while `static/app.js` still formats them as EUR — a display-only follow-up, deliberately not changed
+here. If the embedding model is unavailable the importer defers a row rather than writing text without a
+vector (the API enforces the same rule), so boot the app once (or run `uv run python -c "from app.embeddings
+import warm_up; warm_up()"`) before the first import; `app/seed.py::backfill_embeddings()` repairs any NULL
+embedding at boot.
 
 ## Features
 
@@ -171,6 +229,13 @@ that adds SIMD-accelerated vector search:
   **`docs/opticon-hardware.md`**.
 
 ### Barcode scanner (Opticon M-10)
+- **A plugged-in scanner that produces NOTHING at all?** Run
+  `uv run python scripts/usb_host_check.py` **first** — a dead USB host
+  controller looks exactly like a charge-only cable or a dead scanner (the
+  bus still lists; re-plugging produces no kernel event), and the tool
+  names the dead controller, which physical jacks that means, and the
+  recovery ladder (`docs/m10-unreachable-2026-10-10.md` is the dated
+  evidence).
 - **OS-level grab daemon (round 4, "option 2")**: in USB-HID keyboard mode
   the M-10 "types" into whatever window has focus —
   `scripts/scanner_daemon.py` exclusively grabs its evdev node
@@ -181,11 +246,20 @@ that adds SIMD-accelerated vector search:
   **Install, once per kiosk**:
   1. `sudo cp scripts/udev/99-opticon-scanner.rules /etc/udev/rules.d/` +
      re-plug the scanner (the event node is `root:input 0660` otherwise);
-  2. register the terminal and pair the browser:
-     `uv run python scripts/scanner_daemon.py --config /etc/hcrm/scanner.json
-     --register` — it prints a **single-use 8-char pairing code**; type it
-     (with the terminal id) once into the kiosk browser's login screen
-     ("Pair this terminal");
+  2. register the terminal and pair the browser — **one click, no code
+     to type**: `uv run python scripts/scanner_daemon.py --config
+     /etc/hcrm/scanner.json --register` writes a **single-use pairing
+     offer file** (0600, `<repo>/data/scanner-pairing.json` by default);
+     in the kiosk browser, click the **"no scanner"** pill in the header
+     once — the server reads the offer file, pairs, and consumes it. The
+     pairing code is not printed (it must never touch a journal);
+     `--print-code` opts in for the manual fallback
+     (`curl -X POST /api/scanner/pair -H 'Content-Type: application/json'
+     -d '{"terminal_id": …, "code": …}'`) — e.g. a kiosk whose browser is
+     not on the server host. **Same-user caveat**: the daemon must write
+     the offer file as a user the server can read (under systemd, set
+     `User=` in the unit — a root-written 0600 file is unreadable and
+     /pair/auto answers 500 naming the fix);
   3. `sudo cp scripts/systemd/scanner-daemon.service /etc/systemd/system/ &&
      sudo systemctl enable --now scanner-daemon`.
   The daemon exits (even `kill -9`) → the kernel instantly releases the
@@ -194,13 +268,17 @@ that adds SIMD-accelerated vector search:
   never stops the grab — scans spool (`<config>.spool`, 0600, bounded) and
   replay with per-entry dedupe. Badge payloads are redacted in every
   daemon log line. **Config/env**: `--config` holds
-  `{terminal_id, secret}` (0600, written at register); `--forward URL`
-  (default `http://127.0.0.1:8000`) is the server base;
+  `{terminal_id, secret}` (0600, written at register); `--pairing-file`
+  overrides the offer file's location (default
+  `$HCRM_SCANNER_PAIRING_FILE`, else `<repo>/data/scanner-pairing.json` —
+  the SAME path the server reads; override on BOTH sides if you set it);
+  `--forward URL` (default `http://127.0.0.1:8000`) is the server base;
   `HCRM_SCANNER_REGISTER_ANY=1` opens terminal registration to LAN clients
-  (loopback-only by default); queued scans rest at most
-  `HCRM_SCANNER_EVENT_TTL_SECONDS` (default 300) server-side; `--dry-run`
-  decodes and prints (redacted) with zero HTTP — the hardware-checklist
-  mode (`docs/plans/r4-checklist.md`).
+  (loopback-only by default), and one-click pairing (`/pair/auto`) is
+  loopback-only under its own `HCRM_SCANNER_PAIR_ANY` flag; queued scans
+  rest at most `HCRM_SCANNER_EVENT_TTL_SECONDS` (default 300) server-side;
+  `--dry-run` decodes and prints (redacted) with zero HTTP — the
+  hardware-checklist mode (`docs/plans/r4-checklist.md`).
 - Hardware integration for the Opticon M-10 2D presentation scanner:
   stdlib-first serial driver (`app/scanner/`, pyserial optional — one reader
   thread owns the port, so a scan interleaved with a command ACK is delivered,
@@ -266,6 +344,7 @@ that adds SIMD-accelerated vector search:
 │   └── routers/
 │       ├── auth.py       # /api/auth/*      register, login, QR badge, logout, me
 │       ├── items.py      # /api/items/*     browse, vector-search, input
+│       ├── media.py      # /catalogue-images/<EAN>.<ext>  validated supplier photos
 │       └── members.py    # /api/members/*   account management
 ├── static/               # Vue 3 SPA (index.html, app.js, style.css, vendored libs)
 ├── data/                 # SQLite database (runtime only — git-ignored)
@@ -279,16 +358,31 @@ that adds SIMD-accelerated vector search:
 │   ├── _hcrm.py          # shared script contract: self-hosting, credentials,
 │   │                     # reporting, no password restore
 │   ├── opticon_detect.py # the repo's one map of Opticon USB personalities
+│   ├── usb_host_check.py # host-layer preflight BELOW opticon_detect: dead
+│   │                     # xHCI controllers (a dead one looks exactly like
+│   │                     # a charge-only cable), ModemManager/brltty
+│   │                     # grabbers, missing udev rules, kernel modules
 │   ├── scanner_hid.py    # receive scans from a USB-HID (keyboard-mode) scanner
+│   ├── m10_scan_test.py  # can the attached scanner actually READ? EAN/QR
+│   │                     # targets (QR generated + expected via the vendored
+│   │                     # encoder), Z1/Z2 round-trip on the COM personality
+│   ├── scanner_test.py   # OPN-2001 end-to-end (protocol, clock, batch) +
+│   │                     # HID capture + the M-10 pointer
 │   ├── scanner_daemon.py # round 4: EVIOCGRAB the scanner's evdev node (it
 │   │                     # stops typing into windows) + forward to the queue
+│   ├── agent_note.py     # collision-safe append (flock + O_APPEND) for a
+│   │                     # shared agent coordination file; guarded --mirror
 │   ├── systemd/          # scanner-daemon.service (Restart=always kiosk unit)
 │   ├── udev/             # one-time sudo install: device-node permissions
 │   ├── ui_check.py       # browser gate: renders the SPA + /docs in headless
 │   │                     # Chrome and fails on console errors / missing DOM
 │   ├── smoke_test.py     # end-to-end API test (self-hosts by default)
 │   ├── load_test.py      # availability check: concurrent logins must not lock the DB
-│   └── scanner_bridge.py # Opticon M-10 → catalogue lookup / stock bridge
+│   ├── scanner_bridge.py # Opticon M-10 → catalogue lookup / stock bridge
+│   ├── _biogan.py        # supplier-CSV helpers: byte-faithful read/write, price,
+│   │                     # GTIN, image sniffing, result-page parser
+│   ├── biogan_photos.py  # supplier crawl: photo per SKU → CSV column + images dir
+│   └── import_biogan.py  # supplier CSV → catalogue (idempotent, sku-keyed upsert)
 ├── tests/                # pytest suite (per-test fresh DB, fake embeddings)
 └── pyproject.toml        # uv-managed dependencies
 ```
@@ -328,7 +422,9 @@ that adds SIMD-accelerated vector search:
   (LIKE wildcards `%`/`_` in `q` are escaped and matched literally)
 - `GET /api/items/vector-search?q=&category=&limit=&offset=` — **semantic
   search** (embeds the query, exact cosine scan via sqlite-vector, optional
-  category filter, returns `similarity` per item)
+  category filter, returns `similarity` per item). `limit` is optional: omit
+  it to rank **every** item in the shop by similarity (no threshold/cutoff);
+  pass it (e.g. `limit=5`) for a top-N slice.
 - `GET /api/items/categories` — distinct categories
 - `POST /api/items` / `PATCH /api/items/{id}` / `DELETE /api/items/{id}` —
   staff only; create/update automatically (re-)embed the description. If the
@@ -489,6 +585,7 @@ touching `./data`).
 | **Refunds / voids / receipt re-issue** | Checkout exists (`POST /api/orders`: snapshots, clamp-and-report stock, immutable receipts); what remains open is the after-sale: refunds, voiding an order, re-sending a receipt. |
 | **`PRAGMA foreign_keys` is OFF** | `auth_tokens.user_id` is declarative only; enforcing it needs a table rebuild. The only user-deleting path removes tokens first. |
 | **Quantized ANN scans** (`vector_quantize`) | Exact `vector_full_scan` is comfortable to ~100k items; see the measurements above. |
+| **Supplier prices displayed as EUR** | The Biogan catalogue is priced in DKK (`price_cents` holds the supplier amount) but `static/app.js` formats every price with the EUR symbol. Display-only; changing it would touch all price rendering, so it is a separate, deliberate change. |
 
 ## Next steps (barebones placeholders)
 

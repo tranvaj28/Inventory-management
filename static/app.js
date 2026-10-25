@@ -111,9 +111,6 @@ Vue.createApp({
       loginForm: { email: "", password: "" },
       loginError: "",
       greeting: "",   // the "Hi <name>" login banner (round 3, Task C)
-      badgeCode: "",  // the collapsed manual fallback field (Task E: the
-                       // global capture is the primary no-click path)
-      showBadgeField: false,  // "Use a badge code instead" toggle
       registerForm: { name: "", email: "", password: "" },
       registerError: "",
 
@@ -149,10 +146,11 @@ Vue.createApp({
       // wedge capture above stays installed in EVERY mode — it is the
       // fallback whenever no daemon holds the grab.
       scannerFeed: "unpaired",
-      pairForm: { terminal_id: "", code: "" },   // login-screen pairing
-      pairError: "",
-      pairOk: false,
-      pairBusy: false,
+      pairOpen: false,      // the header pill's PAIRED-state popover
+      pairBusy: false,      // the one-click pair in flight (a JS guard,
+                            // deliberately NOT :disabled — disabling the
+                            // focused pill would drop focus to <body> and
+                            // grey a status indicator)
 
       // data explorer
       allColumns: DATA_COLUMNS,
@@ -174,7 +172,6 @@ Vue.createApp({
       memberForm: { name: "", email: "", password: "", role: "member" },
       memberError: "",
       members: [],
-      scanFieldCode: "",       // the visible scan field (explicit operator intent)
 
       // account
       pwForm: { current_password: "", new_password: "" },
@@ -185,7 +182,7 @@ Vue.createApp({
       myRequests: [],    // "My scan requests" (GET /api/scan-requests/mine)
 
       // Task D — the tabbed "My profile" (#/account, no route churn):
-      // profile | security | badge | purchases | requests. A flagged
+      // profile | security | badge | requests. A flagged
       // account (must_change_password) is steered to "security" on arrival
       // — the redirect keeps working and lands one click from the fix.
       profileTab: "profile",
@@ -241,6 +238,7 @@ Vue.createApp({
       if (!this.user) return this.route === "#/register" ? "register" : "login";
       if (this.route.startsWith("#/admin") && this.isStaff) return "admin";
       if (this.route.startsWith("#/account")) return "account";
+      if (this.route.startsWith("#/purchases")) return "purchases";
       if (this.route.startsWith("#/table") && this.isStaff) return "table";
       // The checkout review screen (round 3, item 4): the catalogue section
       // with the aside swapped to the review panel.
@@ -381,6 +379,25 @@ Vue.createApp({
     // yields the badge card alone (the repo's first @media print block).
     badgePrint(on) { this._printBadge(!!on); },
     memberBadge(on) { this._printBadge(!!on); },
+    // Disclosure focus management: opening focuses the popover's Unpair
+    // button (the paired popover's only focusable — the autofocus
+    // attribute only fires on initial page load, not on a v-if mount);
+    // closing returns focus to the pill.
+    pairOpen(on) {
+      if (!on) {
+        // Disclosure return: the pill re-takes focus when its popover
+        // closes, so keyboard users are not dropped on <body>.
+        this.$nextTick(() => {
+          const pill = document.querySelector(".feed-pill");
+          if (pill) pill.focus();
+        });
+        return;
+      }
+      this.$nextTick(() => {
+        const el = document.querySelector(".pair-popover button");
+        if (el) el.focus();
+      });
+    },
     currentView(view) {
       if (view === "catalogue" || view === "checkout") {
         if (this.items.length === 0) this.reloadItems();
@@ -390,6 +407,10 @@ Vue.createApp({
       }
       if (view === "admin") this.loadAdminData();
       if (view === "table") this.loadDataPage();
+      if (view === "purchases") {
+        this.loadMyOrders();
+        this.loadCalendar();
+      }
       if (view === "account") {
         // A flagged account's mandatory change is the point of the visit:
         // land on the Security tab, one click from the fix. Everyone else
@@ -450,6 +471,11 @@ Vue.createApp({
      * session, load the server cart (+ one-time legacy import), replay any
      * anonymously staged scans, then route. */
     async afterLogin(data) {
+      // A badge scanned while the pairing popover was open logs in and
+      // navigates away programmatically (this.route is pre-set, so the
+      // hashchange's _closeOverlays never fires) — the popover must not
+      // strand over the new view.
+      this.pairOpen = false;
       this.saveSession(data);
       if (data.user.must_change_password) {
         // Server-side enforced: every other endpoint returns 403 until the
@@ -460,6 +486,7 @@ Vue.createApp({
         return;
       }
       await this.loadCart();
+      this._announceCartRestored();
       await this.replayStagedScans();
       location.hash = "#/catalogue";
       this.route = "#/catalogue";
@@ -467,19 +494,11 @@ Vue.createApp({
       this.loadCategories();
     },
 
-    async doBadgeLogin() {
-      // QR badge login: the scanner (USB-HID mode) types the badge payload
-      // into the field and its CR suffix submits the form. The global scan
-      // bus (logged-out badge scans from anywhere) calls badgeLogin()
-      // directly — this field keeps its dedicated behaviour.
-      await this.badgeLogin(this.badgeCode.trim());
-    },
-
     async badgeLogin(code) {
       if (!code) return;
-      // Busy double-fire guard (Task E): a fast double-Enter (the collapsed
-      // fallback + the global capture, or a shaky scan) must not fire two
-      // qr-login requests — the second would mint a throwaway session.
+      // Busy double-fire guard (Task E): a shaky scan (or a fast re-scan)
+      // must not fire two qr-login requests — the second would mint a
+      // throwaway session.
       if (this.busy) return;
       this.loginError = "";
       this.busy = true;
@@ -487,7 +506,6 @@ Vue.createApp({
         const data = await api("/auth/qr-login", {
           method: "POST", body: { token: code },
         });
-        this.badgeCode = "";
         await this.afterLogin(data);
       } catch (e) {
         this.loginError = e.message;
@@ -554,8 +572,11 @@ Vue.createApp({
       // countdown expiry, account switch, session expiry), or to a view the
       // user just navigated away from: leaving them up strands a stale,
       // user-specific dialog over the login screen or the new account.
+      // The pairing popover is terminal-scoped, not user-scoped, but a
+      // dropdown that survives navigation is its own stranding class.
       // badgeSvg/badgePayload are the account view's rotated-badge display —
       // a credential, and the first thing to die with its session.
+      this.pairOpen = false;
       this.detailItem = null;
       this.scanIntake = null;
       this.memberBadge = null;
@@ -594,13 +615,23 @@ Vue.createApp({
       this.clearLogoff();
       this.dismissGreeting();   // the banner dies with its session
       this._closeOverlays();
+      // P2: drain any in-flight cart mutation before tearing the session
+      // down, so a late write can never repopulate the login screen with
+      // the previous user's cart. The cart itself is already durable
+      // server-side — this is about the in-memory view, not persistence.
+      await this.flushCart();
       try { await api("/auth/logout", { method: "POST" }); } catch (_) { /* ignore */ }
+      const hadItems = !!(this.cart && this.cart.total_qty > 0);
       localStorage.removeItem(TOKEN_KEY);
       localStorage.removeItem(USER_KEY);
       this.user = null;
       this.cart = { lines: [], total_qty: 0, total_cents: 0 };
       location.hash = "#/login";
       this.route = "#/login";
+      if (hadItems) {
+        this.showToast("Your list was saved — it will be here when you log back in");
+      }
+      return hadItems;
     },
 
     /* ---------- account ---------- */
@@ -689,6 +720,10 @@ Vue.createApp({
     },
 
     async reloadItems() {
+      // Bump the request generation: any response for the OLD state that
+      // is still in flight (or lands between here and loadMore's commit)
+      // is superseded and must never be committed to the grid.
+      this._itemsGen = (this._itemsGen || 0) + 1;
       this.offset = 0;
       this.items = [];
       this.hasMore = true;
@@ -699,31 +734,55 @@ Vue.createApp({
       if (this.loading || !this.hasMore) return;
       this.loading = true;
       try {
-        const params = new URLSearchParams({
-          limit: PAGE_SIZE, offset: this.offset,
-        });
-        const term = this.search.trim();
-        // The backend requires q to be at least 2 characters for semantic
-        // search; a single character falls back to keyword search.
-        if (this.semantic && term.length >= 2) {
-          // Semantic (vector) search — ranked by meaning similarity.
-          params.set("q", term);
-          if (this.category) params.set("category", this.category);
-          const page = await api("/items/vector-search?" + params.toString());
-          this.items.push(...page);
-          this.offset += page.length;
-          this.hasMore = page.length === PAGE_SIZE;
-        } else {
-          if (term) params.set("q", term);
-          if (this.category) params.set("category", this.category);
-          const page = await api("/items?" + params.toString());
-          this.items.push(...page);
-          this.offset += page.length;
-          this.hasMore = page.length === PAGE_SIZE;
+        // A response superseded mid-flight (reloadItems bumped _itemsGen:
+        // new search term, category or semantic toggle) must be dropped and
+        // re-fetched with the fresh state — committing it used to pin the
+        // grid on results for a filter the operator already changed, with
+        // hasMore = false killing the scroll sentinel (no self-healing).
+        // The REJECT path is included: a superseded request that errors
+        // must also refetch, or the fresh reload silently never runs and
+        // the grid stays empty until the next user action (the sentinel
+        // only fires on intersection *changes*, so it cannot rescue it).
+        for (;;) {
+          const gen = this._itemsGen || 0;
+          const term = this.search.trim();
+          let page;
+          try {
+            // The backend requires q to be at least 2 characters for
+            // semantic search; a single character falls back to keyword
+            // search.
+            if (this.semantic && term.length >= 2) {
+              // Semantic (vector) search — rank EVERY item in the shop by
+              // meaning similarity (no limit, no threshold, no pagination).
+              const params = new URLSearchParams({ q: term });
+              if (this.category) params.set("category", this.category);
+              page = await api("/items/vector-search?" + params.toString());
+            } else {
+              const params = new URLSearchParams({
+                limit: PAGE_SIZE, offset: this.offset,
+              });
+              if (term) params.set("q", term);
+              if (this.category) params.set("category", this.category);
+              page = await api("/items?" + params.toString());
+            }
+          } catch (e) {
+            if (gen !== this._itemsGen) continue;  // stale error: refetch fresh
+            this.showToast(e.message);
+            this.hasMore = false;
+            break;
+          }
+          if (gen !== this._itemsGen) continue;  // superseded — refetch fresh
+          if (this.semantic && term.length >= 2) {
+            this.items = page;
+            this.offset = page.length;
+            this.hasMore = false;
+          } else {
+            this.items.push(...page);
+            this.offset += page.length;
+            this.hasMore = page.length === PAGE_SIZE;
+          }
+          break;
         }
-      } catch (e) {
-        this.showToast(e.message);
-        this.hasMore = false;
       } finally {
         this.loading = false;
       }
@@ -755,13 +814,30 @@ Vue.createApp({
     async flushCart() {
       // The save-then-switch flush: every mutation is already a committed
       // server write — flushing is draining the chain, not persisting.
-      await this._cartChain;
+      // Best-effort: a rejected op must never abort the teardown that
+      // follows (logout/switch clear the session), or a shared kiosk would
+      // strand the previous user.
+      await (this._cartChain || Promise.resolve()).catch(() => {});
     },
 
     async loadCart() {
       if (!this.user || this.user.must_change_password) return; // 403-gated
       this.cart = await api("/cart");
-      await this.importLegacyPurchase();
+      this._cartImportedLegacy = await this.importLegacyPurchase();
+    },
+
+    /* The "your list is durable" reassurance: called ONLY at the session-entry
+     * points (afterLogin, switchAccount) after loadCart — never inside
+     * loadCart itself, which also runs for qty re-syncs and page-load restores
+     * where this would be noise. */
+    _announceCartRestored() {
+      // Skip when the cart was just populated by the one-time legacy import:
+      // that path already toasted "Imported N items", and a second
+      // "restored" toast would clobber it.
+      if (this.cart && this.cart.lines.length && !this._cartImportedLegacy) {
+        this.showToast(`Your purchase list was restored (${this.cart.total_qty} item(s))`);
+      }
+      this._cartImportedLegacy = false;
     },
 
     async importLegacyPurchase() {
@@ -770,9 +846,9 @@ Vue.createApp({
       // cart must never be clobbered by a stale browser copy), then the key
       // dies regardless, so this can never double-run.
       const raw = localStorage.getItem(PURCHASE_KEY);
-      if (!raw) return;
+      if (!raw) return false;
       localStorage.removeItem(PURCHASE_KEY);
-      if (this.cart.lines.length) return;
+      if (this.cart.lines.length) return false;
       try {
         const entries = JSON.parse(raw);
         const lines = (Array.isArray(entries) ? entries : [])
@@ -782,6 +858,7 @@ Vue.createApp({
           try {
             this.cart = await api("/cart", { method: "PUT", body: { lines } });
             this.showToast(`Imported ${lines.length} item(s) from your old purchase list`);
+            return true;
           } catch (e) {
             if (e.status === 404 || e.status === 422) {
               // A deleted catalogue item poisons the all-or-nothing PUT:
@@ -793,10 +870,12 @@ Vue.createApp({
                 } catch (_) { /* item gone from the catalogue */ }
               }
               this.showToast("Imported your old purchase list (some items are gone)");
+              return true;
             } // transient errors: the import is one-time by design
           }
         }
-      } catch (_) { /* malformed legacy data: the key is already removed */ }
+        return false;
+      } catch (_) { /* malformed legacy data: the key is already removed */ return false; }
     },
 
     _stockWarn(line) {
@@ -851,10 +930,6 @@ Vue.createApp({
 
     selectProfileTab(tab) {
       this.profileTab = tab;
-      if (tab === "purchases") {
-        this.loadMyOrders();
-        this.loadCalendar();   // round 3, Task C: the spend calendar's data
-      }
       if (tab === "requests") this.loadMyRequests();
       if (tab === "profile")
         this.phoneForm.phone = (this.user && this.user.phone) || "";
@@ -1103,13 +1178,12 @@ Vue.createApp({
             this.cart = r.data.cart;                    // the emptied cart, one payload
             const pid = r.data.purchase.id;
             this.lastCheckout = pid;                    // "new" chip in history
-            // Land on the purchases tab. route + hash in one synchronous
-            // turn (the hashchange `navigated` guard); the currentView
-            // watcher then fires selectProfileTab("purchases"), which loads
-            // the orders AND the calendar (today's dot appears at once).
-            this.profileTab = "purchases";
-            this.route = "#/account";
-            location.hash = "#/account";
+            // Land on the purchase-history view. route + hash in one
+            // synchronous turn (the hashchange `navigated` guard); the
+            // currentView watcher then loads the orders AND the calendar
+            // (today's dot appears at once).
+            this.route = "#/purchases";
+            location.hash = "#/purchases";
             this.expandedOrders = [pid];                 // pre-expand the receipt
             this.showToast("Purchase complete — " +
               this.formatPrice(r.data.purchase.total_cents));
@@ -1196,8 +1270,8 @@ Vue.createApp({
 
     /** The credential targets of _scanStrictPre: any password field, or the
      * username field of a login form — in this SPA that is the autofocused
-     * `type="text" autocomplete="username"` input on the login screen
-     * (index.html:55-56), i.e. exactly the field a badge scan lands in when
+     * `type="text" autocomplete="username"` input in the login section,
+     * i.e. exactly the field a badge scan lands in when
      * nobody has clicked anywhere. A selector test, so extending the rule is a
      * selector edit and not a code edit. */
     _scanSecretField(el) {
@@ -1246,9 +1320,10 @@ Vue.createApp({
     },
 
     _onScanKey(e) {
-      // Sinks own their keys entirely (the login badge field and the visible
-      // scan field keep their dedicated Enter handlers — no double-fire;
-      // focus changes into them flush via the focusin listener).
+      // Sinks own their keys entirely. No sink element exists since the
+      // login-screen cleanup — the guard is defensive: a reintroduced
+      // sink must never double-fire with the capture bus (focus changes
+      // into a sink flush via the focusin listener).
       if (e.target && e.target.closest && e.target.closest("[data-scan-sink]")) {
         return;
       }
@@ -1407,19 +1482,6 @@ Vue.createApp({
       // plain targets never had their keys prevented)
     },
 
-    scanFieldSubmit() {
-      // The visible scan field (catalogue header): explicit operator intent,
-      // no heuristics — also the deterministic path for payloads the global
-      // gate deliberately ignores (short internal codes). Routing uses the
-      // same badge shapes as the global gate (full AND raw-43 forms — both
-      // are accepted by qr-login/qr-identify), but no length/charset floor.
-      const code = (this.scanFieldCode || "").trim();
-      this.scanFieldCode = "";
-      if (!code) return;
-      const kind = HcrmScanCapture.isBadgeShape(code) ? "badge" : "barcode";
-      this.enqueueScan(code, kind);
-    },
-
     enqueueScan(code, kind) {
       // NEVER render the raw badge payload on screen: it is a bearer
       // credential, shoulder-surfable for the pill's 2 s lifetime. Mask on
@@ -1452,8 +1514,14 @@ Vue.createApp({
     },
 
     _modalOpen() {
-      return !!(this.detailItem || this.memberBadge || this.badgePrint
-        || this.pwResetMember || this.scanIntake || this.lastReceipt);
+      // pairOpen counts as a dialog: the popover paints inside the
+      // topbar's stacking context, BELOW every modal — a barcode scanned
+      // while it is open must hit the "finish the current dialog" toast
+      // instead of opening a modal that strands the popover beneath it
+      // (badges always process, and their login/switch paths close it).
+      return !!(this.pairOpen || this.detailItem || this.memberBadge
+        || this.badgePrint || this.pwResetMember || this.scanIntake
+        || this.lastReceipt);
     },
 
     async handleBadgeScan(code) {
@@ -1519,16 +1587,23 @@ Vue.createApp({
     },
 
     handleSessionExpired() {
-      // Raw-mode 401s land here: the session is dead — mirror the api()
-      // wrapper's throwing-path cleanup (raw callers own their errors, so
-      // the wrapper skipped it). Any open overlay belonged to the dead
-      // session: close it so it cannot strand over the login view.
+      // THE canonical 401 teardown, shared by both expiry paths: raw-mode
+      // callers call it directly (they own their errors), and api()'s
+      // throwing path dispatches hcrm-session-expired after removing the
+      // tokens itself. Any open overlay belonged to the dead session:
+      // close it so it cannot strand over the login view.
       localStorage.removeItem(TOKEN_KEY);
       localStorage.removeItem(USER_KEY);
       this.user = null;
       this.clearLogoff();
       this.dismissGreeting();   // the banner dies with its session
       this._closeOverlays();
+      // The previous user's cart must die with their session exactly as
+      // in logout(): the next user can log in flagged (must_change_password
+      // skips loadCart), so a lingering cart would both display AND be
+      // mutable under the new token — a cross-user leak.
+      this.cart = { lines: [], total_qty: 0, total_cents: 0 };
+      this._cartImportedLegacy = false;
       location.hash = "#/login";
       this.route = "#/login";
       this.showToast("Session expired — please log in again.");
@@ -1586,6 +1661,17 @@ Vue.createApp({
           break;
         case "setPill":
           this.scannerFeed = effect.mode;   // renders data-scanner-feed
+          if (effect.mode === "unpaired") {
+            // The popover mounts ONLY in the paired state. A server-side
+            // unpair (the poll's 401: the terminal was deleted) flips the
+            // pill while the popover is open — and an INVISIBLE
+            // pairOpen=true still counts as an open dialog in
+            // _modalOpen(), so every barcode scan would drop to "finish
+            // the current dialog first" with nothing on screen. Close it
+            // here, the ONE funnel every unpair passes through
+            // (unpairTerminal sets it too — a harmless duplicate).
+            this.pairOpen = false;
+          }
           break;
       }
     },
@@ -1618,43 +1704,51 @@ Vue.createApp({
       }
     },
 
-    async pairTerminal() {
-      // The login-screen pairing panel: the operator types the terminal id
-      // and the 8-char single-use code the daemon printed (round 4, T5).
-      // raw: true — a 401 here is a WRONG CODE, not a user-session expiry,
-      // and must not run api()'s global logout cleanup.
-      this.pairError = "";
-      this.pairOk = false;
-      const terminal_id = (this.pairForm.terminal_id || "").trim();
-      // The server mints UPPERCASE Crockford codes and hash-compares
-      // exactly; an operator typing lowercase at the kiosk must not get a
-      // misleading "wrong code" — normalise (safe: codes never contain
-      // lowercase).
-      const code = (this.pairForm.code || "").trim().toUpperCase();
-      if (!terminal_id || !/^[A-Z0-9]{8}$/.test(code)) {
-        this.pairError = "Enter the terminal id and the 8-character code the daemon printed";
-        return;
-      }
+    onPillClick() {
+      // The pill is a one-click PAIR BUTTON when unpaired (the server
+      // reads the offer file the daemon wrote — no code to type), and a
+      // disclosure toggle for the paired-state popover otherwise.
+      if (this.scannerFeed === "unpaired") return this.autoPair();
+      this.pairOpen = !this.pairOpen;
+    },
+
+    async autoPair() {
+      // One-click pairing: POST /api/scanner/pair/auto. raw: true is
+      // LOAD-BEARING — a 401 here is a stale offer file, not a
+      // user-session expiry, and must never run api()'s global logout
+      // cleanup (the manual-pairing path's comment, carried over).
+      // body: {} keeps the JSON content-type the endpoint's CSRF gate
+      // requires.
+      if (this.pairBusy) return;   // the badgeLogin double-fire precedent
       this.pairBusy = true;
       try {
-        const { status, data } = await api("/scanner/pair", {
-          method: "POST", body: { terminal_id, code }, raw: true,
+        const { status, data } = await api("/scanner/pair/auto", {
+          method: "POST", body: {}, raw: true,
         });
         if (status === 200 && data && data.token) {
           localStorage.setItem(TERMINAL_TOKEN_KEY, data.token);
-          this.pairForm = { terminal_id: "", code: "" };
-          this.pairOk = true;
+          // The pill flipping to live/off IS the success feedback; say it
+          // once as a toast.
+          this.pairOpen = false;
+          this.showToast("Scanner paired — scans from this terminal now " +
+                         "arrive here, even with this window unfocused");
           this._feedDispatch({ type: "paired", token: data.token });
-        } else if (status === 401) {
-          this.pairError = "Unknown terminal or wrong pairing code";
-        } else if (status === 409) {
-          this.pairError = "This terminal is already paired — a staff member " +
-            "must delete it, then re-register the daemon";
         } else {
-          this.pairError = "Pairing failed (" + status + ")";
+          // The server's messages ARE the operator instructions; fall
+          // back per status when the body carried none.
+          const detail = data && data.detail;
+          const fallbacks = {
+            403: "One-click pairing is loopback-only — use a browser on " +
+                 "the server host, or set HCRM_SCANNER_PAIR_ANY=1",
+            404: "No pairing file on the server — run " +
+                 "scanner_daemon.py --register on the kiosk host, then " +
+                 "click the pill again",
+          };
+          this.showToast((detail && detail.message) ||
+                         fallbacks[status] || ("Pairing failed (" + status + ")"));
         }
       } catch (e) {
-        this.pairError = e.message;
+        this.showToast(e.message);
       } finally {
         this.pairBusy = false;
       }
@@ -1663,6 +1757,12 @@ Vue.createApp({
     unpairTerminal() {
       localStorage.removeItem(TERMINAL_TOKEN_KEY);
       this._feedDispatch({ type: "unpair" });
+      // Close the popover: the pill itself is now the re-pair affordance
+      // (one click once the daemon has re-registered) — the recovery
+      // loop is Unpair → DELETE + --register → click the pill.
+      this.pairOpen = false;
+      this.showToast("Unpaired — re-run scanner_daemon.py --register, " +
+                     "then click the pill to pair again");
     },
 
     /* ---------- kiosk logoff countdown (Task 4's server deadline) ---------- */
@@ -1682,6 +1782,11 @@ Vue.createApp({
       const iso = data.logoff_deadline;
       const deadline = new Date(/Z$|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + "Z");
       this.clearLogoff();
+      // A badge re-scan can arm the countdown while the pairing popover
+      // is open; the overlay must not share the screen with it (the
+      // popover paints below the overlay in the topbar's stacking
+      // context, so an open popover would strand under it).
+      this.pairOpen = false;
       this.logoff = { name: this.user.name, deadline, remaining: data.grace_seconds };
       this._logoffTimer = setInterval(() => this.tickLogoff(), 250);
       this.tickLogoff();
@@ -1695,8 +1800,10 @@ Vue.createApp({
 
     async finishLogoff() {
       this.clearLogoff();
-      await this.logout();   // best-effort: the server deadline already killed
-      this.showToast("Logged off"); // the token if the browser was throttled
+      const announcedSave = await this.logout();   // best-effort: the server
+      if (!announcedSave) {                        // deadline already killed
+        this.showToast("Logged off");              // the token if throttled
+      }
     },
 
     async cancelLogoff() {
@@ -1739,17 +1846,27 @@ Vue.createApp({
       });                                           //    foreign token never
                                                     //    trips the 401 redirect)
       if (auth.user.must_change_password) {
+        // P2: the incoming user's cart never loaded — drop the OUTGOING
+        // user's cart from the view so it can't linger in the UI.
+        this.cart = { lines: [], total_qty: 0, total_cents: 0 };
         location.hash = "#/account";
         this.route = "#/account";
         this.showToast(`Switched to ${auth.user.name} — change the password to continue`);
         return;
       }
       await this.loadCart();                        // 6. the incoming user's list
+      this._announceCartRestored();
       this.reloadItems();
       this.loadCategories();
       location.hash = "#/catalogue";
       this.route = "#/catalogue";
-      this.showToast(`Switched to ${auth.user.name} — ${oldName}'s list was saved`);
+      // The save-then-switch message: the outgoing list is durable and will
+      // be back when that user returns — surfaced on the greeting banner
+      // (not a 3 s toast) so the save is legible. Deliberately PERSISTENT
+      // (click-dismissible via dismissGreeting): no auto-dismiss timer —
+      // the reassurance must survive until the next user starts scanning.
+      this.greeting = `Switched to ${auth.user.name} — ${oldName}'s list was saved and will be back when ${oldName} signs in`;
+      clearTimeout(this._greetingTimer);
       await this.replayStagedScans();
     },
 
@@ -1803,6 +1920,7 @@ Vue.createApp({
     /* ---------- unknown-item intake modal ---------- */
 
     openNextIntake() {
+      this.pairOpen = false;   // the intake modal must not strand the popover
       if (this.scanIntake || !this.intakeQueue.length) return;  // one at a time
       const detail = this.intakeQueue.shift();                  // skip = drop
       this.scanIntake = {
@@ -2404,14 +2522,12 @@ Vue.createApp({
       if (navigated) this._closeOverlays();
     });
 
-    // The api() wrapper broadcasts this when a request comes back 401:
-    // drop the in-memory session and show the login screen.
+    // The api() wrapper broadcasts this when a request comes back 401
+    // (it has already removed the tokens): run the canonical teardown —
+    // the SAME handleSessionExpired() the raw-mode 401 callers use, so
+    // the two expiry paths can never drift apart again.
     window.addEventListener("hcrm-session-expired", () => {
-      this.user = null;
-      this.clearLogoff();   // a pending countdown's timer must die here
-      this.dismissGreeting();  // the banner names a user whose session is dead
-      this._closeOverlays();  // ...and the dead session's modals with it
-      this.route = "#/login";
+      this.handleSessionExpired();
     });
 
     // The global HID scan capture: one document-level listener, always on
@@ -2433,6 +2549,7 @@ Vue.createApp({
       if (this.currentView === "admin") this.loadAdminData();
       if (this.currentView === "table") this.loadDataPage();
       if (this.currentView === "account") this.loadMyRequests();
+      if (this.currentView === "purchases") { this.loadMyOrders(); this.loadCalendar(); }
     }
 
     // Infinite scroll: load more items when the sentinel becomes visible.
